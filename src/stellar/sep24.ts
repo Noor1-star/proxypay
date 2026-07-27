@@ -1,15 +1,11 @@
 import { Router, Request, Response } from "express";
 import { sep24RateLimiter } from "../middleware/rateLimit";
 import { v4 as uuidv4 } from "uuid";
-import { Transaction, Keypair, StrKey } from "stellar-sdk";
-import {
-  getStellarServer,
-  getNetworkPassphrase,
-  STELLAR_NETWORKS,
-} from "../config/stellar";
+import { Keypair, StrKey } from "stellar-sdk";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { enqueueSepWebhook } from "../services/stellar/webhooks";
+import { sep24TransactionModel } from "../models/sep24Transaction";
 
 function isValidStellarPublicKey(key: string): boolean {
   try {
@@ -197,6 +193,20 @@ export const generateInteractiveUrl = async (
 
   transactions.set(transactionId, transaction);
 
+  try {
+    await sep24TransactionModel.create({
+      kind,
+      status: "pending_user_transfer_start",
+      asset_in: request.asset_code,
+      amount_in: request.amount,
+      account: request.account,
+      memo: request.memo,
+      callback: request.callback,
+    });
+  } catch (err) {
+    console.error(`[sep24] Failed to persist transaction ${transactionId}:`, err);
+  }
+
   const params = new URLSearchParams({
     transaction_id: transactionId,
     asset_code: request.asset_code,
@@ -284,33 +294,72 @@ export const initiateWithdrawal = async (
   return generateInteractiveUrl(request, "withdrawal");
 };
 
-export const getTransaction = (id: string): Sep24Transaction | undefined =>
-  transactions.get(id);
+export const getTransaction = async (id: string): Promise<Sep24Transaction | undefined> => {
+  if (transactions.has(id)) return transactions.get(id);
+  const dbTx = await sep24TransactionModel.findById(id);
+  if (dbTx) {
+    const mapped: Sep24Transaction = {
+      id: dbTx.id,
+      kind: dbTx.kind,
+      status: dbTx.status,
+      asset_in: dbTx.asset_in,
+      asset_out: dbTx.asset_out,
+      amount_in: dbTx.amount_in,
+      amount_out: dbTx.amount_out,
+      amount_fee: dbTx.amount_fee,
+      account: dbTx.account,
+      memo: dbTx.memo,
+      memo_type: dbTx.memo_type,
+      from: dbTx.from,
+      to: dbTx.to,
+      callback: dbTx.callback,
+      message: dbTx.message,
+      more_info_url: dbTx.more_info_url,
+      created_at: dbTx.created_at,
+      completed_at: dbTx.completed_at,
+      updated_at: dbTx.updated_at,
+    };
+    transactions.set(id, mapped);
+    return mapped;
+  }
+  return undefined;
+};
 
-export const updateTransactionStatus = (
+export const updateTransactionStatus = async (
   id: string,
   status: Sep24TransactionStatus,
   message?: string,
-): Sep24Transaction | undefined => {
+): Promise<Sep24Transaction | undefined> => {
   const transaction = transactions.get(id);
-  if (!transaction) return undefined;
+  if (!transaction) {
+    const dbTx = await sep24TransactionModel.findById(id);
+    if (!dbTx) return undefined;
+    transactions.set(id, dbTx as unknown as Sep24Transaction);
+  }
 
-  const statusChanged = transaction.status !== status;
-  transaction.status = status;
-  transaction.updated_at = new Date().toISOString();
-  if (message) transaction.message = message;
+  const tx = transactions.get(id)!;
+  const statusChanged = tx.status !== status;
+  tx.status = status;
+  tx.updated_at = new Date().toISOString();
+  if (message) tx.message = message;
   if (status === "completed")
-    transaction.completed_at = new Date().toISOString();
+    tx.completed_at = new Date().toISOString();
 
-  transactions.set(id, transaction);
+  transactions.set(id, tx);
 
-  if (statusChanged && transaction.callback) {
-    enqueueSepWebhook(transaction.id, status, transaction.callback, transaction).catch((err) =>
+  try {
+    await sep24TransactionModel.updateStatus(id, status, message);
+  } catch (err) {
+    console.error(`[sep24] Failed to update status in DB for ${id}:`, err);
+  }
+
+  if (statusChanged && tx.callback) {
+    enqueueSepWebhook(tx.id, status, tx.callback, tx).catch((err) =>
       console.error(`[sep24-webhook] Error enqueuing webhook:`, err)
     );
   }
 
-  return transaction;
+  return tx;
 };
 
 export interface CallbackData {
@@ -331,8 +380,13 @@ export const processCallback = async (
   data: CallbackData,
 ): Promise<Sep24Transaction | null> => {
   const { transaction_id, status, message, ...extra } = data;
-  const transaction = transactions.get(transaction_id);
-  if (!transaction) return null;
+  let transaction = transactions.get(transaction_id);
+  if (!transaction) {
+    const dbTx = await sep24TransactionModel.findById(transaction_id);
+    if (!dbTx) return null;
+    transactions.set(transaction_id, dbTx as unknown as Sep24Transaction);
+    transaction = transactions.get(transaction_id)!;
+  }
 
   const statusChanged = transaction.status !== status;
   transaction.status = status;
@@ -353,6 +407,23 @@ export const processCallback = async (
   }
 
   transactions.set(transaction_id, transaction);
+
+  try {
+    await sep24TransactionModel.updateTransaction(transaction_id, {
+      status,
+      message,
+      amount_in: extra.amount_in,
+      amount_out: extra.amount_out,
+      amount_fee: extra.amount_fee,
+      asset_in: extra.asset_in,
+      asset_out: extra.asset_out,
+      from: extra.from,
+      to: extra.to,
+      memo: extra.memo,
+    });
+  } catch (err) {
+    console.error(`[sep24] Failed to persist callback update for ${transaction_id}:`, err);
+  }
 
   if (statusChanged && transaction.callback) {
     enqueueSepWebhook(transaction.id, status, transaction.callback, transaction).catch((err) =>
@@ -466,7 +537,7 @@ sep24Router.post(
 );
 
 sep24Router.get("/transaction/:id", async (req: Request, res: Response) => {
-  const transaction = getTransaction(req.params.id);
+  const transaction = await getTransaction(req.params.id);
   if (!transaction) {
     throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
       error: "Not found",
@@ -477,7 +548,54 @@ sep24Router.get("/transaction/:id", async (req: Request, res: Response) => {
 
 sep24Router.put("/transaction/:id", async (req: Request, res: Response) => {
   const { status, message } = req.body;
-  const transaction = updateTransactionStatus(req.params.id, status, message);
+  const transaction = await updateTransactionStatus(req.params.id, status, message);
+  if (!transaction) {
+    throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
+      error: "Not found",
+    });
+  }
+  res.json(transaction);
+});
+
+// SEP-24 compliant routes
+sep24Router.post(
+  "/transactions/deposit/interactive",
+  sep24Limiter,
+  async (req: Request, res: Response) => {
+    try {
+      const result = await initiateDeposit(req.body);
+      res.json(result);
+    } catch (error: any) {
+      throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
+        error: error.message,
+      });
+    }
+  },
+);
+
+sep24Router.post(
+  "/transactions/withdraw/interactive",
+  sep24Limiter,
+  async (req: Request, res: Response) => {
+    try {
+      const result = await initiateWithdrawal(req.body);
+      res.json(result);
+    } catch (error: any) {
+      throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
+        error: error.message,
+      });
+    }
+  },
+);
+
+sep24Router.get("/transaction", async (req: Request, res: Response) => {
+  const id = req.query.id as string;
+  if (!id) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "Missing transaction id", {
+      error: "Missing id query parameter",
+    });
+  }
+  const transaction = await getTransaction(id);
   if (!transaction) {
     throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
       error: "Not found",
@@ -518,7 +636,7 @@ sep24Router.post("/callback/:id", async (req: Request, res: Response) => {
 });
 
 sep24Router.get("/success", async (req: Request, res: Response) => {
-  const transaction = getTransaction(req.query.id as string);
+  const transaction = await getTransaction(req.query.id as string);
   if (!transaction) {
     throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
       error: "Not found",
@@ -528,7 +646,7 @@ sep24Router.get("/success", async (req: Request, res: Response) => {
 });
 
 sep24Router.get("/failure", async (req: Request, res: Response) => {
-  const transaction = getTransaction(req.query.id as string);
+  const transaction = await getTransaction(req.query.id as string);
   if (!transaction)
     throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
       error: "Not found",
